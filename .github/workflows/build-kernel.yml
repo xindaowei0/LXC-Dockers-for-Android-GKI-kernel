@@ -1,0 +1,209 @@
+name: Build Android Kernels
+
+permissions:
+  contents: read
+  actions: write
+  artifacts: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Target Device'
+        required: true
+        type: choice
+        options:
+        - mondrian
+        - vermeer
+        - sheng
+      toolchain:
+        description: 'Toolchain'
+        required: false
+        default: 'clang'
+        type: choice
+        options:
+        - clang
+        - gcc
+      clean_build:
+        description: 'Clean Build'
+        required: false
+        default: false
+        type: boolean
+      enable_docker:
+        description: 'Enable Docker Support'
+        required: false
+        default: false
+        type: boolean
+
+  push:
+    branches: [main, master]
+    tags: ['v*']
+
+env:
+  USE_CCACHE: 1
+  CCACHE_EXEC: /usr/bin/ccache
+  CCACHE_MAXSIZE: 5G
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        device: [mondrian, vermeer, sheng]
+    # 如果指定了特定设备，只构建该设备
+    if: |
+       (github.event_name == 'workflow_dispatch' && github.event.inputs.device == matrix.device) ||
+       (github.event_name != 'workflow_dispatch')
+
+    
+    name: Build Kernel for ${{ matrix.device }}
+    timeout-minutes: 120
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install all build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          git \
+          curl \
+          wget \
+          python3 \
+          python3-pip \
+          make \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libelf-dev \
+          libncurses-dev \
+          device-tree-compiler \
+          lz4 \
+          lzop \
+          zip \
+          tar \
+          ccache \
+          patchelf \
+          rsync \
+          gcc-aarch64-linux-gnu \
+          gcc-arm-linux-gnueabi \
+          gcc-11-aarch64-linux-gnu \
+          g++-11-aarch64-linux-gnu \
+          xmlstarlet \
+          openssl \
+          file \
+          cpio \
+          kmod \
+          pkg-config \
+          libgmp-dev \
+          libmpc-dev \
+          libmpfr-dev \
+          libisl-dev
+
+    - name: Install Python dependencies
+      run: |
+        pip3 install --upgrade pip
+        pip3 install \
+          pycrypto \
+          pyelftools \
+          protobuf \
+          google \
+          requests
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: kernel-${{ matrix.device }}-${{ github.sha }}
+        restore-keys: |
+          kernel-${{ matrix.device }}-
+
+    - name: Create device configs if missing
+      run: |
+        echo "Creating device configuration files..."
+        mkdir -p arch/arm64/configs
+        
+        # 为每个设备创建基础配置文件
+        for device in mondrian vermeer sheng; do
+          CONFIG_FILE="arch/arm64/configs/${device}_defconfig"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "# Default configuration for $device" > "$CONFIG_FILE"
+            echo "CONFIG_ARM64=y" >> "$CONFIG_FILE"
+            echo "CONFIG_ARCH_QCOM=y" >> "$CONFIG_FILE"
+            echo "CONFIG_SMP=y" >> "$CONFIG_FILE"
+            echo "CONFIG_HOTPLUG_CPU=y" >> "$CONFIG_FILE"
+            echo "CONFIG_DEVTMPFS=y" >> "$CONFIG_FILE"
+            echo "CONFIG_DEVTMPFS_MOUNT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_BLK_DEV_INITRD=y" >> "$CONFIG_FILE"
+            echo "CONFIG_CMA=y" >> "$CONFIG_FILE"
+            echo "CONFIG_PM_DEVFREQ=y" >> "$CONFIG_FILE"
+            echo "CONFIG_CPU_FREQ=y" >> "$CONFIG_FILE"
+            echo "CONFIG_CPUFREQ_DT=y" >> "$CONFIG_FILE"
+            echo "CONFIG_ACPI=y" >> "$CONFIG_FILE"
+            echo "CONFIG_CPU_IDLE=y" >> "$CONFIG_FILE"
+            echo "CONFIG_NET=y" >> "$CONFIG_FILE"
+            echo "CONFIG_INET=y" >> "$CONFIG_FILE"
+            echo "CONFIG_IP_MULTICAST=y" >> "$CONFIG_FILE"
+            
+            # 设备特定配置
+            case $device in
+              mondrian)
+                echo "CONFIG_MACH_XIAOMI_MONDRIAN=y" >> "$CONFIG_FILE"
+                echo "CONFIG_QCOM_SM8475=y" >> "$CONFIG_FILE"
+                ;;
+              vermeer)
+                echo "CONFIG_MACH_XIAOMI_VERMEER=y" >> "$CONFIG_FILE"
+                echo "CONFIG_QCOM_SM8550=y" >> "$CONFIG_FILE"
+                ;;
+              sheng)
+                echo "CONFIG_MACH_XIAOMI_SHENG=y" >> "$CONFIG_FILE"
+                echo "CONFIG_QCOM_SM8550=y" >> "$CONFIG_FILE"
+                echo "CONFIG_INPUT_TOUCHSCREEN=y" >> "$CONFIG_FILE"
+                ;;
+            esac
+          fi
+        done
+    
+    - name: Set up build script
+      run: |
+        # 为脚本添加执行权限
+        chmod +x scripts/build_kernel.sh
+        
+        # 显示脚本内容以确认
+        echo "Build script is ready for execution"
+    
+    - name: Execute build script
+      run: |
+        # 构建命令参数
+        BUILD_ARGS="-d ${{ matrix.device }} -t ${{ github.event.inputs.toolchain || 'clang' }}"
+        
+        # 添加清洁构建参数（如果启用）
+        if [ "${{ github.event.inputs.clean_build }}" = "true" ]; then
+          BUILD_ARGS="$BUILD_ARGS -c"
+        fi
+        
+        # 添加Docker参数（如果启用）
+        if [ "${{ github.event.inputs.enable_docker }}" = "true" ]; then
+          BUILD_ARGS="$BUILD_ARGS -D"
+        fi
+        
+        echo "Running build script with args: $BUILD_ARGS"
+        ./scripts/build_kernel.sh $BUILD_ARGS
+    
+    - name: Verify artifacts
+      if: success()
+      run: |
+        echo "Verifying build artifacts..."
+        ls -la build_artifacts/${{ matrix.device }}/
+    
+    - name: Upload build artifacts
+      if: success()
+      uses: actions/upload-artifact@v3
+      with:
+        name: kernel-${{ matrix.device }}-${{ github.run_number }}
+        path: build_artifacts/${{ matrix.device }}/**/*
+        retention-days: 7
